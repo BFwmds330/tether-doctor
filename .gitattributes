@@ -1,0 +1,20 @@
+# 仓库内统一存 LF，检出时按平台给回 CRLF
+* text=auto
+
+# Windows 脚本：检出必须是 CRLF（LF 的 .bat 在 cmd 里可能解析异常）
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+
+# 文档与配置：保持 LF
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# 二进制（如有）
+*.zip binary
+*.png binary
+*.jpg binary

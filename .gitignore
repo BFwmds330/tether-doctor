@@ -1,0 +1,13 @@
+# 打包产物 / 本地临时文件
+*.zip
+dist/
+out/
+
+# PowerShell
+*.tmp
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
