@@ -44,6 +44,14 @@
 .PARAMETER TestCount
   -Test 时每个目标的探测次数，默认 20。
 
+.PARAMETER Export
+  导出「诊断包」到指定目录：体检全程的结构化记录会写成 JSON 与一份自包含 HTML 报告；
+  -Watch 模式下同时把监控的 md/csv 一并复制进去。配合 -Sanitize 使用即可安全分享。
+
+.PARAMETER Sanitize
+  导出前脱敏：MAC 打码为 XX-XX、IPv4 保留前两段（192.168.x.x）、USB VID/PID 与序列号打码。
+  只影响导出的文件，屏幕输出不变。
+
 .EXAMPLE
   .\tether-doctor.ps1
   只读体检，不改任何设置。
@@ -55,6 +63,10 @@
 .EXAMPLE
   .\tether-doctor.ps1 -Watch 120 -Interval 3
   挂机监控 2 小时，每 3 秒采样一次，结束（或 Ctrl+C）时输出断流证据链报告。
+
+.EXAMPLE
+  .\tether-doctor.ps1 -Export .\to-share -Sanitize
+  体检并导出脱敏后的诊断包（JSON + HTML）到 to-share 目录，可直接发给别人。
 
 .EXAMPLE
   .\tether-doctor.ps1 -Apply
@@ -77,24 +89,97 @@ param(
   [int]$FailThreshold = 2,
   [int]$SlowMs = 500,
   [string[]]$Dns = @('223.5.5.5', '119.29.29.29'),
-  [int]$TestCount = 20
+  [int]$TestCount = 20,
+  [string]$Export = '',
+  [switch]$Sanitize
 )
+
+$script:Version = '1.2.0'
 
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 $script:changes = New-Object System.Collections.ArrayList
+$script:report = New-Object System.Collections.ArrayList   # 全程输出记录（供 -Export 导出诊断包）
+$script:curSection = ''
+$script:testStats = @()
 
-function Section($t) { Write-Host ''; Write-Host ("=" * 66) -ForegroundColor DarkGray; Write-Host " $t" -ForegroundColor Cyan; Write-Host ("=" * 66) -ForegroundColor DarkGray }
-function Ok($t)     { Write-Host "  [OK]   $t" -ForegroundColor Green }
-function Warn($t)   { Write-Host "  [注意] $t" -ForegroundColor Yellow }
-function Bad($t)    { Write-Host "  [问题] $t" -ForegroundColor Red }
-function Info($t)   { Write-Host "  · $t" -ForegroundColor Gray }
-function Todo($t)   { Write-Host "  [待办] $t" -ForegroundColor Magenta }
+function Section($t) { Write-Host ''; Write-Host ("=" * 66) -ForegroundColor DarkGray; Write-Host " $t" -ForegroundColor Cyan; Write-Host ("=" * 66) -ForegroundColor DarkGray; $script:curSection = $t; [void]$script:report.Add([pscustomobject]@{ Section = $t; Level = 'HEAD'; Text = '' }) }
+function Ok($t)     { Write-Host "  [OK]   $t" -ForegroundColor Green; [void]$script:report.Add([pscustomobject]@{ Section = $script:curSection; Level = 'OK'; Text = "$t" }) }
+function Warn($t)   { Write-Host "  [注意] $t" -ForegroundColor Yellow; [void]$script:report.Add([pscustomobject]@{ Section = $script:curSection; Level = 'WARN'; Text = "$t" }) }
+function Bad($t)    { Write-Host "  [问题] $t" -ForegroundColor Red; [void]$script:report.Add([pscustomobject]@{ Section = $script:curSection; Level = 'BAD'; Text = "$t" }) }
+function Info($t)   { Write-Host "  · $t" -ForegroundColor Gray; [void]$script:report.Add([pscustomobject]@{ Section = $script:curSection; Level = 'INFO'; Text = "$t" }) }
+function Todo($t)   { Write-Host "  [待办] $t" -ForegroundColor Magenta; [void]$script:report.Add([pscustomobject]@{ Section = $script:curSection; Level = 'TODO'; Text = "$t" }) }
+
+# ---------------------------------------------------------------- 诊断包导出（-Export / -Sanitize）
+function ConvertTo-SanitizedText([string]$s) {
+  if ([string]::IsNullOrEmpty($s)) { return $s }
+  $s = $s -replace '\b([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}\b', 'XX-XX-XX-XX-XX-XX'
+  $s = $s -replace '\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}\b', '$1.$2.x.x'
+  $s = $s -replace 'VID_[0-9A-Fa-f]{4}&PID_[0-9A-Fa-f]{4}', 'VID_XXXX&PID_XXXX'
+  $s = $s -replace '(MI_\d+\\)[0-9A-Fa-f&]+', '$1<已脱敏>'
+  return $s
+}
+function ConvertTo-HtmlText([string]$s) {
+  if ([string]::IsNullOrEmpty($s)) { return $s }
+  return ($s -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;')
+}
+function Invoke-Export {
+  try {
+    $expDir = $Export
+    if (-not (Test-Path $expDir)) { New-Item -ItemType Directory -Path $expDir -Force | Out-Null }
+    $expStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $jsonPath = Join-Path $expDir "tether-doctor-$expStamp.json"
+    $htmlPath = Join-Path $expDir "tether-doctor-$expStamp.html"
+    $fx = if ($Sanitize) { { param($s) ConvertTo-SanitizedText $s } } else { { param($s) $s } }
+
+    $meta = [pscustomobject]@{
+      Tool = 'tether-doctor'; Version = $script:Version
+      Time = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); Mode = $mode; Sanitized = [bool]$Sanitize
+      PowerShell = $PSVersionTable.PSVersion.ToString()
+      Adapter = if ($ad) { [pscustomobject]@{ Name = (& $fx $ad.Name); Description = (& $fx $ad.InterfaceDescription); IfIndex = $ad.ifIndex; Mac = (& $fx $ad.MacAddress); PnpId = (& $fx $ad.PnPDeviceID); LinkSpeed = "$($ad.LinkSpeed)" } } else { $null }
+      TestStats = @($script:testStats)
+    }
+    $entries = @($script:report | ForEach-Object { [pscustomobject]@{ Section = (& $fx $_.Section); Level = $_.Level; Text = (& $fx $_.Text) } })
+    [IO.File]::WriteAllText($jsonPath, ([pscustomobject]@{ Meta = $meta; Entries = $entries } | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($true)))
+
+    $h = New-Object System.Collections.ArrayList
+    [void]$h.Add('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>tether-doctor 诊断报告</title>')
+    [void]$h.Add('<style>body{font-family:"Microsoft YaHei",Segoe UI,sans-serif;max-width:960px;margin:24px auto;padding:0 12px;color:#222}h1{font-size:20px}h2{font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px;margin-top:28px}table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #ccc;padding:4px 10px}ul{list-style:none;padding-left:8px}li{padding:2px 0;font-size:13px}.OK::before{content:"[OK]   ";color:#0a0}.WARN::before{content:"[注意] ";color:#c80}.BAD::before{content:"[问题] ";color:#c00}.TODO::before{content:"[待办] ";color:#808}.INFO::before{content:"·      ";color:#888}.OK{color:#060}.WARN{color:#a60}.BAD{color:#900}.TODO{color:#707}.INFO{color:#555}</style></head><body>')
+    $sub = if ($Sanitize) { '（已脱敏，可分享）' } else { '' }
+    [void]$h.Add("<h1>tether-doctor v$($script:Version) 诊断报告$sub</h1>")
+    $adTxt = if ($ad) { ConvertTo-HtmlText (& $fx "$($ad.Name) — $($ad.InterfaceDescription)") } else { '（未识别到共享网卡）' }
+    [void]$h.Add("<table><tr><th>时间</th><td>$(ConvertTo-HtmlText (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))</td><th>模式</th><td>$(ConvertTo-HtmlText $mode)</td></tr><tr><th>PowerShell</th><td>$($PSVersionTable.PSVersion)</td><th>网卡</th><td>$adTxt</td></tr></table>")
+    $curSec = ''
+    foreach ($e in $entries) {
+      if ($e.Level -eq 'HEAD') { if ($curSec) { [void]$h.Add('</ul>') }; [void]$h.Add('<h2>' + (ConvertTo-HtmlText $e.Section) + '</h2><ul>'); $curSec = $e.Section }
+      else { [void]$h.Add('<li class="' + $e.Level + '">' + (ConvertTo-HtmlText $e.Text) + '</li>') }
+    }
+    if ($curSec) { [void]$h.Add('</ul>') }
+    [void]$h.Add('<p style="color:#888;font-size:12px;margin-top:32px">由 tether-doctor 生成（只读诊断，纯静态 HTML）。脱敏规则：MAC→XX-XX、IPv4 保留前两段、USB VID/PID 与序列号打码。</p></body></html>')
+    [IO.File]::WriteAllText($htmlPath, ($h -join "`r`n"), (New-Object Text.UTF8Encoding($true)))
+
+    if ($Watch -gt 0 -and $mdPath) {
+      foreach ($src in @($mdPath, $csvPath)) {
+        if (-not $src -or -not (Test-Path $src)) { continue }
+        $dst = Join-Path $expDir (Split-Path $src -Leaf)
+        if ($Sanitize) {
+          $lines = @(Get-Content $src -Encoding UTF8 | ForEach-Object { ConvertTo-SanitizedText $_ })
+          [IO.File]::WriteAllLines($dst, $lines, (New-Object Text.UTF8Encoding($true)))
+        } else { Copy-Item $src $dst -Force }
+      }
+      Ok "监控报告与 CSV 已一并复制到：$expDir"
+    }
+    Ok "诊断包已导出：$htmlPath"
+    Ok "结构化数据（可程序化处理）：$jsonPath"
+    if (-not $Sanitize) { Warn '导出内容未脱敏（含 IP / MAC / 设备标识），分享前请确认，或改用 -Sanitize' }
+  } catch { Bad "诊断包导出失败：$($_.Exception.Message)" }
+}
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $mode = if ($Apply) { 'APPLY（落地改动）' } elseif ($Revert) { 'REVERT（回滚）' } elseif ($Watch -gt 0) { "WATCH（挂机监控 $Watch 分钟）" } elseif ($Test) { 'REPORT+TEST（体检 + 实测）' } else { 'REPORT（只读体检）' }
 
 Section "环境"
+Info ("tether-doctor v{0}" -f $script:Version)
 Info ("PowerShell {0} / {1}" -f $PSVersionTable.PSVersion, [Environment]::OSVersion.VersionString)
 if ($isAdmin) { Ok '当前以管理员身份运行' } else { Warn '当前不是管理员：体检查得全，但 -Apply / -Revert 会失败（用随附的 .bat 提权运行）' }
 Info "运行模式：$mode"
@@ -111,6 +196,7 @@ try {
     if (-not $cands) {
       Bad "指定的网卡不存在：$(if ($AdapterName) { "-AdapterName $AdapterName" } else { "-InterfaceIndex $InterfaceIndex" })"
       Info ('可用网卡：' + ((Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name)[$($_.ifIndex)]" }) -join '、'))
+      if ($Export) { Invoke-Export }
       return
     }
     Info '（使用 -AdapterName / -InterfaceIndex 显式指定的网卡；USB 相关判定会自动按网卡类型降级）'
@@ -128,6 +214,7 @@ if (-not $cands) {
     Info ('当前处于已连接状态的网卡：' + (($up | ForEach-Object { "$($_.Name)($($_.InterfaceDescription))" }) -join '、'))
     Info '若想体检其中某一块（例如 Wi-Fi），用：-AdapterName "<接口名>" 或 -InterfaceIndex <编号>'
   }
+  if ($Export) { Invoke-Export }
   return
 }
 if (@($cands).Count -gt 1) { Warn "找到多个候选适配器，取第一个；如有误请按接口名自行调整。" }
@@ -376,6 +463,16 @@ if ($Watch -gt 0) {
   $csvPath = Join-Path $LogDir "watch-$stamp.csv"
   $mdPath = Join-Path $LogDir "watch-$stamp.md"
 
+  # 增量落盘：CSV 边采边写。挂机场景断电/崩溃/误杀进程时，已完成的样本仍留在磁盘上，结束时只补 MD 报告。
+  $csvWriter = $null
+  function ConvertTo-CsvLine([object[]]$vals) {
+    ($vals | ForEach-Object { $v = if ($null -eq $_) { '' } else { "$_" }; '"' + ($v -replace '"', '""') + '"' }) -join ','
+  }
+  try {
+    $csvWriter = New-Object IO.StreamWriter($csvPath, $false, [Text.Encoding]::UTF8)
+    $csvWriter.WriteLine('"T","Time","Ok","MinMs","AlidnsMs","BaiduMs","AdapterState","LinkSpeed","IPv4","Gateway"')
+  } catch { $csvWriter = $null; Warn "CSV 增量写入初始化失败（将改为结束时一次性写出）：$($_.Exception.Message)" }
+
   $targets = @(
     [pscustomobject]@{ Name = 'alidns'; Host = '223.5.5.5'; Port = 443 }
     [pscustomobject]@{ Name = 'baidu'; Host = 'www.baidu.com'; Port = 443 }
@@ -426,6 +523,12 @@ if ($Watch -gt 0) {
           AdapterState = $state; LinkSpeed = $link; IPv4 = $ip; Gateway = $gw
         })
       $cur = $samples[$samples.Count - 1]
+      if ($csvWriter) {
+        try {
+          $csvWriter.WriteLine((ConvertTo-CsvLine @($cur.T.ToString('yyyy-MM-dd HH:mm:ss'), $cur.Time, $cur.Ok, $cur.MinMs, $cur.AlidnsMs, $cur.BaiduMs, $cur.AdapterState, $cur.LinkSpeed, $cur.IPv4, $cur.Gateway)))
+          if ($i % 10 -eq 0) { $csvWriter.Flush() }
+        } catch { try { $csvWriter.Close() } catch {}; $csvWriter = $null; Warn "CSV 增量写入失败（将改为结束时一次性写出）：$($_.Exception.Message)" }
+      }
 
       if ($prevSample -and ($prevSample.AdapterState -ne $state -or $prevSample.LinkSpeed -ne $link -or $prevSample.IPv4 -ne $ip -or $prevSample.Gateway -ne $gw)) {
         $desc = @()
@@ -469,8 +572,13 @@ if ($Watch -gt 0) {
       [void]$events.Add([pscustomobject]@{ Time = $outageStart.ToString('HH:mm:ss'); Type = '断流(未恢复)'; Seconds = $secs; State = $outageState; Detail = "监控结束时仍未恢复，已持续约 ${secs}s" })
     }
 
-    # 统一带 BOM 的 UTF-8：5.1 的 'UTF8' 自带 BOM，7.x 需显式 'utf8BOM'，否则中文 Excel 直接打开会乱码
-    try { $csvEnc = if ($PSVersionTable.PSVersion.Major -ge 7) { 'utf8BOM' } else { 'UTF8' }; $samples | Export-Csv -Path $csvPath -NoTypeInformation -Encoding $csvEnc } catch { Warn "CSV 写入失败：$($_.Exception.Message)" }
+    if ($csvWriter) {
+      try { $csvWriter.Flush(); $csvWriter.Close() } catch { Warn "CSV 收尾失败：$($_.Exception.Message)" }
+      Info "CSV 已边采边写完成：$csvPath"
+    } elseif ($samples.Count) {
+      # 增量写入不可用时的兜底：结束时一次性写出（统一带 BOM 的 UTF-8：5.1 的 'UTF8' 自带 BOM，7.x 需显式 'utf8BOM'）
+      try { $csvEnc = if ($PSVersionTable.PSVersion.Major -ge 7) { 'utf8BOM' } else { 'UTF8' }; $samples | Export-Csv -Path $csvPath -NoTypeInformation -Encoding $csvEnc } catch { Warn "CSV 写入失败：$($_.Exception.Message)" }
+    }
 
     # ---- 统计 ----
     $okS = @($samples | Where-Object { $_.Ok })
@@ -607,6 +715,7 @@ if ($Watch -gt 0) {
     [void]$md.Add('')
     [void]$md.Add("逐次采样记录（CSV，可直接用 Excel 画图）：``$csvPath``")
     [void]$md.Add('')
+    [void]$md.Add('> CSV 为边采边写：即使监控被强杀 / 断电，已完成的样本也保留在文件中。')
     [void]$md.Add('> 想看清「开热点 / 接电话 / 换位置」是否与断流相关，把当时记下的时刻与第 2、4 节的时间戳对齐即可。')
 
     try {
@@ -631,16 +740,21 @@ elseif ($Test) {
         if ($iar.AsyncWaitHandle.WaitOne(5000)) { $c.EndConnect($iar); $sw.Stop(); [void]$t.Add($sw.Elapsed.TotalMilliseconds) } else { $fail++ }
       } catch { $fail++ } finally { $c.Close() }
     }
-    if ($t.Count -eq 0) { Bad "$Target`:$Port —— $Count 次全部失败（也可能该目标本就不在 $Port 提供服务，以 www.baidu.com 那条为准）"; return }
+    if ($t.Count -eq 0) { Bad "$Target`:$Port —— $Count 次全部失败（也可能该目标本就不在 $Port 提供服务，以 www.baidu.com 那条为准）"; return $null }
     $s = $t | Sort-Object
     $jit = 0; for ($i = 1; $i -lt $t.Count; $i++) { $jit += [math]::Abs($t[$i] - $t[$i - 1]) }
     $avg = ($t | Measure-Object -Average).Average
     $line = "{0}:{1}  成功 {2}/{3}  最小 {4:N0}ms  中位 {5:N0}ms  平均 {6:N0}ms  最大 {7:N0}ms  抖动 {8:N0}ms" -f `
       $Target, $Port, $t.Count, $Count, $s[0], $s[[int]($s.Count / 2)], $avg, $s[$s.Count - 1], ($jit / [math]::Max(1, $t.Count - 1))
     if ($fail -gt 0) { Bad $line } elseif ($s[$s.Count - 1] -gt 300 -or ($jit / [math]::Max(1, $t.Count - 1)) -gt 30) { Warn $line } else { Ok $line }
+    [pscustomobject]@{
+      Target = "$Target`:$Port"; Ok = $t.Count; Total = $Count; Fail = $fail
+      MinMs = [math]::Round($s[0], 1); MedMs = [math]::Round($s[[int]($s.Count / 2)], 1); AvgMs = [math]::Round($avg, 1)
+      MaxMs = [math]::Round($s[$s.Count - 1], 1); JitterMs = [math]::Round($jit / [math]::Max(1, $t.Count - 1), 1)
+    }
   }
-  Test-Tcp '223.5.5.5' 443 $TestCount        # 阿里公共DNS，纯 IP、不依赖 DNS 解析
-  Test-Tcp 'www.baidu.com' 443 $TestCount    # 真实站点，含 DNS 解析与首连
+  $r = Test-Tcp '223.5.5.5' 443 $TestCount; if ($r) { $script:testStats += $r }        # 阿里公共DNS，纯 IP、不依赖 DNS 解析
+  $r = Test-Tcp 'www.baidu.com' 443 $TestCount; if ($r) { $script:testStats += $r }    # 真实站点，含 DNS 解析与首连
   $sw = [Diagnostics.Stopwatch]::StartNew()
   try { [void][System.Net.Dns]::GetHostAddresses('www.baidu.com'); $sw.Stop(); Info ("DNS 解析 www.baidu.com 用时 {0:N0} ms" -f $sw.Elapsed.TotalMilliseconds) } catch { Warn 'DNS 解析失败' }
   Info '（想看真实带宽请用浏览器 Speedtest，或手机端直接测速对比：若手机很快、电脑很慢才说明瓶颈在电脑/USB）'
@@ -667,4 +781,8 @@ if ($Watch -gt 0 -and $mdPath) { Ok "监控报告：$mdPath"; Ok "原始数据�
 if ($script:changes.Count) { Write-Host "  本次改动：" -ForegroundColor Cyan; $script:changes | ForEach-Object { Ok $_ } }
 elseif ($Apply -or $Revert) { Info '本次没有实际改动（可能都已是最优，或缺少管理员权限）' }
 else { Info '只读体检完成，零写入。要落地安全项请用 .bat 提权后加 -Apply' }
+
+# ---------------------------------------------------------------- 诊断包导出（-Export，可选）
+if ($Export) { Invoke-Export }
+
 Write-Host ''

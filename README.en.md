@@ -78,6 +78,21 @@ The key inference:
 - NIC **not Up** during the outage → the problem is on the **USB side** (cable contact, power, driver reload).
 - NIC **still Up** but no connectivity → the physical link is fine; suspect the **phone** (signal, radio mode switching, throttled plan, power saving) or the carrier.
 
+## Diagnostic bundle: a shareable report in one flag
+
+`-Export` writes every check's verdict (including `-Test` stats) to two files:
+
+```powershell
+.\tether-doctor.ps1 -Export .\to-share -Sanitize
+```
+
+- `tether-doctor-<timestamp>.html` — self-contained static page (no JS), forward or print as-is
+- `tether-doctor-<timestamp>.json` — structured data for scripts and baselines
+
+`-Sanitize` masks MACs to XX-XX, keeps the first two IPv4 octets (192.168.x.x), and masks USB VID/PID + serials —
+exported files only, screen output is untouched. In `-Watch` mode the md/csv are included (sanitized line by line);
+even a failed run with no tethering adapter found can be exported — that is exactly the output worth sharing.
+
 ## Quick start
 
 ```powershell
@@ -108,6 +123,8 @@ The three `.bat` files self-elevate (one UAC prompt). Or call the script directl
 | `-SlowMs <ms>` | Samples slower than this are marked degraded, default 500 |
 | `-AdapterName` / `-InterfaceIndex` | Target a specific adapter |
 | `-Dns` / `-TestCount` | DNS written by `-Apply` / probes per target for `-Test` |
+| `-Export <dir>` | Export a diagnostic bundle (JSON + self-contained HTML); includes watch md/csv |
+| `-Sanitize` | Mask MAC→XX-XX, keep first two IPv4 octets, mask USB VID/PID & serials in exported files only |
 
 ## Sample output (excerpt)
 

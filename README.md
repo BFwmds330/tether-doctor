@@ -100,6 +100,21 @@
 
 > 想看「开热点 / 接电话 / 换位置」是否与断流相关？把当时记下的时刻与报告里的时间戳对齐即可。
 
+## 诊断包：一键导出可分享的报告
+
+求助时最麻烦的是「描述不清症状」。`-Export` 把体检全程的判定记录（含 `-Test` 统计）导出成两份文件：
+
+```powershell
+.\tether-doctor.ps1 -Export .\to-share -Sanitize
+```
+
+- `tether-doctor-<时间戳>.html` —— 自包含静态页（无 JS），直接转发、打印都行
+- `tether-doctor-<时间戳>.json` —— 结构化数据，可程序化处理
+
+`-Sanitize` 在导出时把 MAC 打码为 XX-XX、IPv4 保留前两段（192.168.x.x）、USB VID/PID 与序列号打码——
+只影响导出的文件，屏幕输出照旧。`-Watch` 模式下监控的 md/csv 也会一并导出（脱敏逐行生效）；
+连「没找到共享网卡」的失败运行都能导出——跑不通时的信息恰恰最值得发给别人看。
+
 ## 快速开始
 
 ```powershell
@@ -133,6 +148,8 @@ cd tether-doctor
 | `-SlowMs <毫秒>` | 超过该延迟记为劣化样本，默认 500 |
 | `-AdapterName` / `-InterfaceIndex` | 显式指定网卡（默认自动识别 USB 共享网卡） |
 | `-Dns` / `-TestCount` | `-Apply` 写入的 DNS / `-Test` 每目标探测次数 |
+| `-Export <目录>` | 导出诊断包（JSON + 自包含 HTML）；`-Watch` 时连监控 md/csv 一起导出 |
+| `-Sanitize` | 导出前脱敏：MAC→XX-XX、IPv4 保留前两段、USB VID/PID 与序列号打码（只影响导出文件） |
 
 ## 示例输出（节选）
 

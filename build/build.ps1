@@ -33,6 +33,11 @@ if (-not $Version) {
 }
 $Version = $Version.TrimStart('v')
 
+# 版本一致性：主脚本内嵌 $script:Version 必须与 CHANGELOG 当前版本一致（CHANGELOG 仍是唯一真源）
+$m2 = Select-String -Path (Join-Path $root 'tether-doctor.ps1') -Pattern '\$script:Version\s*=\s*''(\d+\.\d+\.\d+)'''
+if (-not $m2) { throw 'tether-doctor.ps1 里找不到 $script:Version 常量' }
+if ($m2.Matches[0].Groups[1].Value -ne $Version) { throw "主脚本版本 $($m2.Matches[0].Groups[1].Value) 与 CHANGELOG 版本 $Version 不一致" }
+
 $include = @(
   'tether-doctor.ps1'
   '1-check.bat', '2-apply.bat', '3-revert.bat'
