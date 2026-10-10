@@ -1,18 +1,81 @@
 ﻿<#
-  tether-doctor.ps1 —— 手机 USB 共享网络 体检 / 优化 / 回滚
-  适用：Windows 10/11 + 安卓手机 USB(tethering) 共享网络
-  用法：
-    .\tether-doctor.ps1              仅体检（零写入，默认）
-    .\tether-doctor.ps1 -Test        体检 + 延迟/丢包实测（只用几十 KB 流量）
-    .\tether-doctor.ps1 -Apply       落地安全项（需管理员）
-    .\tether-doctor.ps1 -Revert      回滚本脚本做过的改动（需管理员）
-  设计原则：默认绝不写入；-Apply 只做可逆、有把握的四件事，Hub 那类只能手点的会打印清单。
+.SYNOPSIS
+  手机 USB 共享网络（RNDIS / Tethering）体检、优化、回滚与挂机监控。
+
+.DESCRIPTION
+  默认只读体检，零写入。所有改动必须显式 -Apply，且每一项都能 -Revert 回滚。
+  -Test 做秒级延迟/丢包/抖动实测；-Watch 做长时间挂机监控，输出断流事件与证据链报告。
+  适用：Windows 10 / 11 + 安卓手机 USB 共享网络。
+
+.PARAMETER Apply
+  落地安全项（需管理员）：关闭全局 USB 选择性暂停、设置公共 DNS、禁用本手机报错接口等。
+
+.PARAMETER AdapterName
+  显式指定要体检的网卡接口名（默认自动识别 USB 共享网卡）。
+  指向 Wi-Fi / 以太网时，USB 专属判定会自动跳过，可用于监控任意链路的稳定性。
+
+.PARAMETER InterfaceIndex
+  显式指定要体检的网卡 ifIndex，作用同 -AdapterName。
+
+.PARAMETER Revert
+  回滚 -Apply 做过的可逆改动（需管理员）。
+
+.PARAMETER Test
+  体检后追加 TCP 往返 / 丢包 / 抖动实测（约几十 KB 流量）。
+
+.PARAMETER Watch
+  挂机监控的分钟数。例如 -Watch 120 表示连续监控 2 小时，输出 CSV 原始数据与 Markdown 报告。
+
+.PARAMETER Interval
+  监控采样间隔（秒），默认 3。间隔越短越容易抓到瞬时断流，日志也越大。
+
+.PARAMETER LogDir
+  监控报告输出目录，默认为当前目录下的 logs 子目录。
+
+.PARAMETER FailThreshold
+  连续失败多少次采样判定为一次「断流事件」，默认 2。
+
+.PARAMETER SlowMs
+  单次采样延迟超过该毫秒数记为「劣化样本」，默认 500。
+
+.PARAMETER Dns
+  -Apply 时写入共享网卡的 DNS，默认 223.5.5.5 / 119.29.29.29。
+
+.PARAMETER TestCount
+  -Test 时每个目标的探测次数，默认 20。
+
+.EXAMPLE
+  .\tether-doctor.ps1
+  只读体检，不改任何设置。
+
+.EXAMPLE
+  .\tether-doctor.ps1 -Test
+  体检 + 每个目标 20 次 TCP 往返实测。
+
+.EXAMPLE
+  .\tether-doctor.ps1 -Watch 120 -Interval 3
+  挂机监控 2 小时，每 3 秒采样一次，结束（或 Ctrl+C）时输出断流证据链报告。
+
+.EXAMPLE
+  .\tether-doctor.ps1 -Apply
+  落地安全项（需管理员）。
+
+.NOTES
+  本文件必须以 UTF-8 with BOM 保存，否则 Windows PowerShell 5.1 会把中文读成乱码并报语法错误。
+  集线器层省电开关没有可靠的注册表等价物，脚本只打印清单，需手动点击。
 #>
 [CmdletBinding()]
 param(
+  [string]$AdapterName = '',
+  [int]$InterfaceIndex = -1,
   [switch]$Apply,
   [switch]$Revert,
   [switch]$Test,
+  [int]$Watch = 0,
+  [int]$Interval = 3,
+  [string]$LogDir,
+  [int]$FailThreshold = 2,
+  [int]$SlowMs = 500,
   [string[]]$Dns = @('223.5.5.5', '119.29.29.29'),
   [int]$TestCount = 20
 )
@@ -29,35 +92,53 @@ function Info($t)   { Write-Host "  · $t" -ForegroundColor Gray }
 function Todo($t)   { Write-Host "  [待办] $t" -ForegroundColor Magenta }
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$mode = if ($Apply) { 'APPLY（落地改动）' } elseif ($Revert) { 'REVERT（回滚）' } else { 'REPORT（只读体检）' }
+$mode = if ($Apply) { 'APPLY（落地改动）' } elseif ($Revert) { 'REVERT（回滚）' } elseif ($Watch -gt 0) { "WATCH（挂机监控 $Watch 分钟）" } elseif ($Test) { 'REPORT+TEST（体检 + 实测）' } else { 'REPORT（只读体检）' }
 
 Section "环境"
 Info ("PowerShell {0} / {1}" -f $PSVersionTable.PSVersion, [Environment]::OSVersion.VersionString)
 if ($isAdmin) { Ok '当前以管理员身份运行' } else { Warn '当前不是管理员：体检查得全，但 -Apply / -Revert 会失败（用随附的 .bat 提权运行）' }
 Info "运行模式：$mode"
 
-# ---------------------------------------------------------------- 1. 找到共享适配器
+# ---------------------------------------------------------------- 1. 找到目标适配器
 Section "1. 共享网络适配器"
 $cands = @()
+$explicit = ($AdapterName -or $InterfaceIndex -ge 0)
 try {
-  $cands = Get-NetAdapter -ErrorAction Stop | Where-Object {
-    $_.Status -eq 'Up' -and ($_.InterfaceDescription -match 'NDIS|RNDIS|Remote|Tether|Gadget|Internet Sharing' -or $_.Name -match 'NDIS')
+  if ($explicit) {
+    $cands = @(Get-NetAdapter -ErrorAction Stop | Where-Object {
+        ($AdapterName -and $_.Name -eq $AdapterName) -or ($InterfaceIndex -ge 0 -and $_.ifIndex -eq $InterfaceIndex)
+      })
+    if (-not $cands) {
+      Bad "指定的网卡不存在：$(if ($AdapterName) { "-AdapterName $AdapterName" } else { "-InterfaceIndex $InterfaceIndex" })"
+      Info ('可用网卡：' + ((Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name)[$($_.ifIndex)]" }) -join '、'))
+      return
+    }
+    Info '（使用 -AdapterName / -InterfaceIndex 显式指定的网卡；USB 相关判定会自动按网卡类型降级）'
+  } else {
+    $cands = @(Get-NetAdapter -ErrorAction Stop | Where-Object {
+        $_.Status -eq 'Up' -and ($_.InterfaceDescription -match 'NDIS|RNDIS|Remote|Tether|Gadget|Internet Sharing' -or $_.Name -match 'NDIS')
+      })
   }
 } catch { Bad "Get-NetAdapter 失败：$($_.Exception.Message)" }
 
 if (-not $cands) {
   Bad '没有找到 USB 共享网络适配器。请确认手机已插好并已在手机上打开「USB 共享网络」。'
   $up = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object Status -eq 'Up'
-  if ($up) { Info ('当前处于已连接状态的网卡：' + (($up | ForEach-Object { "$($_.Name)($($_.InterfaceDescription))" }) -join '、')) }
+  if ($up) {
+    Info ('当前处于已连接状态的网卡：' + (($up | ForEach-Object { "$($_.Name)($($_.InterfaceDescription))" }) -join '、'))
+    Info '若想体检其中某一块（例如 Wi-Fi），用：-AdapterName "<接口名>" 或 -InterfaceIndex <编号>'
+  }
   return
 }
 if (@($cands).Count -gt 1) { Warn "找到多个候选适配器，取第一个；如有误请按接口名自行调整。" }
 $ad = @($cands)[0]
+$isUsb = ($ad.PnPDeviceID -like 'USB\*') -or ($ad.InterfaceDescription -match 'NDIS|RNDIS|Remote|Tether|Gadget|Internet Sharing')
 
 Info "接口名        : $($ad.Name)"
 Info "描述          : $($ad.InterfaceDescription)"
 Info "ifIndex / MAC : $($ad.ifIndex) / $($ad.MacAddress)"
 Info "PnP 实例      : $($ad.PnPDeviceID)"
+Info "接口类型      : $(if ($isUsb) { 'USB 共享网络（RNDIS / Tethering）' } else { '非 USB 网卡（USB 专属判定会自动跳过）' })"
 
 $ipcfg = Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
 $gw    = Get-NetRoute -InterfaceIndex $ad.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -72,16 +153,22 @@ Info "DNS           : $(if ($dnsNow) { $dnsNow -join ', ' } else { '(未显式�
 $link = 0
 try { $link = [double]($ad.LinkSpeed -replace '[^\d\.]', '') } catch {}
 if ($ad.LinkSpeed -match 'Gbps') { $link *= 1000 }
-if ($link -ge 100) {
-  Ok "USB 链路协商速率 $($ad.LinkSpeed) —— 线材/USB 口没问题，瓶颈不在这里"
-} elseif ($link -gt 0) {
-  Bad "USB 链路只有 $($ad.LinkSpeed)（典型 12Mbps = USB 全速）。换数据线、直插 USB 3.0 口、别用扩展坞/HUB。"
-} else { Warn "读不到链路速率：$($ad.LinkSpeed)" }
+if ($isUsb) {
+  if ($link -ge 100) {
+    Ok "USB 链路协商速率 $($ad.LinkSpeed) —— 线材/USB 口没问题，瓶颈不在这里"
+  } elseif ($link -gt 0) {
+    Bad "USB 链路只有 $($ad.LinkSpeed)（典型 12Mbps = USB 全速）。换数据线、直插 USB 3.0 口、别用扩展坞/HUB。"
+  } else { Warn "读不到链路速率：$($ad.LinkSpeed)" }
+} else {
+  Info "链路速率：$($ad.LinkSpeed)（非 USB 网卡，不做 USB 全速判定）"
+}
 
 # ---------------------------------------------------------------- 2. USB 父设备链
 Section "2. USB 物理链路（手机插在哪一级）"
 $hubName = $null; $portInfo = $null; $hubInst = $null
-if ($ad.PnPDeviceID) {
+if (-not $isUsb) {
+  Info '该网卡不是 USB 设备，跳过 USB 物理链路还原（其余检查照常进行）'
+} elseif ($ad.PnPDeviceID) {
   $cur = $ad.PnPDeviceID; $depth = 0
   while ($cur -and $depth -lt 6) {
     $d = Get-PnpDevice -InstanceId $cur -ErrorAction SilentlyContinue
@@ -226,13 +313,16 @@ Section "9. 异常设备（手机复合设备里有接口报错会周期性重�
 $badDevs = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'OK' }
 if (-not $badDevs) { Ok '没有异常设备' }
 foreach ($b in $badDevs) {
-  $isPhone = $b.InstanceId -like ($ad.PnPDeviceID -replace '&MI_\d+.*$', '*')
+  $isPhone = $isUsb -and ($b.InstanceId -like ($ad.PnPDeviceID -replace '&MI_\d+.*$', '*'))
   $tag = if ($isPhone) { '   ← 属于本手机，优先处理' } else { '' }
   if ($b.Status -eq 'Error') { Bad ("{0}  [{1}]  {2}{3}" -f $b.FriendlyName, $b.Status, $b.InstanceId, $tag) }
   elseif ($b.Status -eq 'Degraded') { Info ("{0}  [{1}]（通常无害）" -f $b.FriendlyName, $b.Status) }
   else { Warn ("{0}  [{1}]  {2}{3}" -f $b.FriendlyName, $b.Status, $b.InstanceId, $tag) }
 }
-$phoneBad = $badDevs | Where-Object { $_.Status -eq 'Error' -and $_.InstanceId -like ($ad.PnPDeviceID -replace '&MI_\d+.*$', '*') -and $_.InstanceId -notlike '*&MI_00*' }
+$phoneBad = @()
+if ($isUsb) {
+  $phoneBad = @($badDevs | Where-Object { $_.Status -eq 'Error' -and $_.InstanceId -like ($ad.PnPDeviceID -replace '&MI_\d+.*$', '*') -and $_.InstanceId -notlike '*&MI_00*' })
+}
 if ($phoneBad) {
   Todo '处理方式（任选其一）：① 装荣耀/华为官方手机助手把驱动补齐；② 手机开发者选项里关掉「USB 调试 / HDB 调试」；③ 直接禁用该接口（本脚本 -Apply 会做）'
   if ($Apply) {
@@ -250,8 +340,260 @@ if ($phoneBad) {
 }
 Info '另：ROOT\USB\... 下报错的「USB Device(VID_xxx)」是软件虚拟设备（模拟器/手机助手残留），与共享无关，可在设备管理器里直接卸载。'
 
-# ---------------------------------------------------------------- 10. 实测（可选）
-if ($Test) {
+# ---------------------------------------------------------------- 10. 挂机监控（-Watch）
+if ($Watch -gt 0) {
+  Section "10. 挂机监控：$Watch 分钟 / 每 $Interval 秒采样"
+
+  if (-not $LogDir) { $LogDir = Join-Path (Get-Location) 'logs' }
+  if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $csvPath = Join-Path $LogDir "watch-$stamp.csv"
+  $mdPath = Join-Path $LogDir "watch-$stamp.md"
+
+  $targets = @(
+    [pscustomobject]@{ Name = 'alidns'; Host = '223.5.5.5'; Port = 443 }
+    [pscustomobject]@{ Name = 'baidu'; Host = 'www.baidu.com'; Port = 443 }
+  )
+  $totalSamples = [int][math]::Max(1, [math]::Floor($Watch * 60 / [math]::Max(1, $Interval)))
+  Info ("探测目标 : " + (($targets | ForEach-Object { "$($_.Host):$($_.Port)" }) -join '、'))
+  Info "采样     : 每 ${Interval}s 一次，共约 $totalSamples 次，预计 $((Get-Date).AddMinutes($Watch).ToString('HH:mm:ss')) 结束"
+  Info "判定规则 : 连续失败 $FailThreshold 次采样 = 一次断流；单次延迟 > ${SlowMs}ms = 劣化样本"
+  Info "报告     : $mdPath"
+  Info "原始数据 : $csvPath"
+  Todo '中途请记下你操作的时刻（开热点 / 接电话 / 换位置 / 改设置），报告按时间戳对齐即可定位因果'
+  Info '随时按 Ctrl+C 结束，报告照常生成。'
+
+  $samples = New-Object System.Collections.ArrayList
+  $events = New-Object System.Collections.ArrayList
+  $started = Get-Date
+  $failRun = 0; $outageStart = $null; $outageState = ''; $prevSample = $null
+
+  try {
+    for ($i = 1; $i -le $totalSamples; $i++) {
+      $ts = Get-Date
+      $lat = @{}; $okAny = $false
+      foreach ($t in $targets) {
+        $ms = $null
+        $c = New-Object Net.Sockets.TcpClient
+        try {
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $iar = $c.BeginConnect($t.Host, $t.Port, $null, $null)
+          if ($iar.AsyncWaitHandle.WaitOne(4000)) { $c.EndConnect($iar); $sw.Stop(); $ms = [math]::Round($sw.Elapsed.TotalMilliseconds, 1); $okAny = $true }
+        } catch { } finally { $c.Close() }
+        $lat[$t.Name] = $ms
+      }
+
+      $state = 'Missing'; $link = ''; $ip = ''; $gw = ''
+      $na = Get-NetAdapter -InterfaceIndex $ad.ifIndex -ErrorAction SilentlyContinue
+      if ($na) {
+        $state = "$($na.Status)"; $link = "$($na.LinkSpeed)"
+        $ip = ((@(Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress) -join ',')
+        $g = Get-NetRoute -InterfaceIndex $ad.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($g) { $gw = "$($g.NextHop)" }
+      }
+      $okMs = @($lat.Values | Where-Object { $_ -ne $null })
+      $minMs = if ($okMs.Count) { ($okMs | Measure-Object -Minimum).Minimum } else { $null }
+
+      [void]$samples.Add([pscustomobject]@{
+          T = $ts; Time = $ts.ToString('HH:mm:ss'); Ok = $okAny; MinMs = $minMs
+          AlidnsMs = $lat['alidns']; BaiduMs = $lat['baidu']
+          AdapterState = $state; LinkSpeed = $link; IPv4 = $ip; Gateway = $gw
+        })
+      $cur = $samples[$samples.Count - 1]
+
+      if ($prevSample -and ($prevSample.AdapterState -ne $state -or $prevSample.LinkSpeed -ne $link -or $prevSample.IPv4 -ne $ip -or $prevSample.Gateway -ne $gw)) {
+        $desc = @()
+        if ($prevSample.AdapterState -ne $state) { $desc += "适配器状态 $($prevSample.AdapterState) → $state" }
+        if ($prevSample.LinkSpeed -ne $link) { $desc += "链路速率 $($prevSample.LinkSpeed) → $link" }
+        if ($prevSample.IPv4 -ne $ip) { $desc += "IPv4 $($prevSample.IPv4) → $ip" }
+        if ($prevSample.Gateway -ne $gw) { $desc += "网关 $($prevSample.Gateway) → $gw" }
+        $d = ($desc -join '；')
+        [void]$events.Add([pscustomobject]@{ Time = $ts.ToString('HH:mm:ss'); Type = '状态变化'; Seconds = 0; State = $state; Detail = $d })
+        Warn "[$($ts.ToString('HH:mm:ss'))] 状态变化：$d"
+      }
+      $prevSample = $cur
+
+      if (-not $okAny) {
+        $failRun++
+        if ($failRun -eq $FailThreshold) {
+          $outageStart = $ts; $outageState = $state
+          Warn "[$($ts.ToString('HH:mm:ss'))] 疑似断流开始（连续 $failRun 次采样全部失败，适配器 $state）"
+        }
+      } else {
+        if ($failRun -ge $FailThreshold -and $outageStart) {
+          $secs = [int][math]::Round(($ts - $outageStart).TotalSeconds, 0)
+          [void]$events.Add([pscustomobject]@{ Time = $outageStart.ToString('HH:mm:ss'); Type = '断流'; Seconds = $secs; State = $outageState; Detail = "持续约 ${secs}s（$failRun 次失败采样），期间适配器 $outageState" })
+          Bad "[$($ts.ToString('HH:mm:ss'))] 断流结束：持续约 ${secs}s"
+        }
+        $failRun = 0; $outageStart = $null; $outageState = ''
+      }
+
+      if ($i -eq 1 -or $i % 20 -eq 0) {
+        $okNow = @($samples | Where-Object { $_.Ok }).Count
+        $outNow = @($events | Where-Object { $_.Type -eq '断流' }).Count
+        $show = if ($null -eq $minMs) { '超时' } else { "$minMs ms" }
+        Info ("[{0}] 采样 {1}/{2}  成功 {3}  当前 {4}  断流 {5} 次" -f $ts.ToString('HH:mm:ss'), $i, $totalSamples, $okNow, $show, $outNow)
+      }
+      if ($i -lt $totalSamples) { Start-Sleep -Seconds $Interval }
+    }
+  } finally {
+    $ended = Get-Date
+    if ($failRun -ge $FailThreshold -and $outageStart) {
+      $secs = [int][math]::Round(($ended - $outageStart).TotalSeconds, 0)
+      [void]$events.Add([pscustomobject]@{ Time = $outageStart.ToString('HH:mm:ss'); Type = '断流(未恢复)'; Seconds = $secs; State = $outageState; Detail = "监控结束时仍未恢复，已持续约 ${secs}s" })
+    }
+
+    try { $samples | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 } catch { Warn "CSV 写入失败：$($_.Exception.Message)" }
+
+    # ---- 统计 ----
+    $okS = @($samples | Where-Object { $_.Ok })
+    $msArr = @($okS | Where-Object { $_.MinMs -ne $null } | ForEach-Object { [double]$_.MinMs } | Sort-Object)
+    $rate = if ($samples.Count) { [math]::Round(100 * $okS.Count / $samples.Count, 2) } else { 0 }
+    $statMin = ''; $statMed = ''; $statP95 = ''; $statMax = ''; $statAvg = ''; $statJit = ''
+    if ($msArr.Count) {
+      $statMin = $msArr[0]
+      $statMed = $msArr[[int]($msArr.Count / 2)]
+      $statP95 = $msArr[[math]::Min($msArr.Count - 1, [int][math]::Floor($msArr.Count * 0.95))]
+      $statMax = $msArr[$msArr.Count - 1]
+      $statAvg = [math]::Round(($msArr | Measure-Object -Average).Average, 1)
+      $jit = 0
+      for ($k = 1; $k -lt $msArr.Count; $k++) { $jit += [math]::Abs($msArr[$k] - $msArr[$k - 1]) }
+      $statJit = [math]::Round($jit / [math]::Max(1, $msArr.Count - 1), 1)
+    }
+    $slowS = @($okS | Where-Object { $_.MinMs -ne $null -and $_.MinMs -gt $SlowMs })
+    $outages = @($events | Where-Object { $_.Type -like '断流*' })
+    $stateChanges = @($events | Where-Object { $_.Type -eq '状态变化' })
+    $outageSeconds = 0; foreach ($o in $outages) { $outageSeconds += [int]$o.Seconds }
+    $spanSec = [math]::Max(1, ($ended - $started).TotalSeconds)
+
+    # ---- 分时段（每 5 分钟）----
+    $buckets = @()
+    if ($samples.Count) {
+      $buckets = @($samples | Group-Object { $_.T.AddMinutes(-1 * ($_.T.Minute % 5)).ToString('yyyy-MM-dd HH:mm') } | Sort-Object Name | ForEach-Object {
+          $g = @($_.Group)
+          $gOk = @($g | Where-Object { $_.Ok })
+          $gMs = @($gOk | Where-Object { $_.MinMs -ne $null } | ForEach-Object { [double]$_.MinMs })
+          [pscustomobject]@{
+            时段 = $_.Name.Substring(11)
+            采样 = $g.Count
+            成功率 = if ($g.Count) { [math]::Round(100 * $gOk.Count / $g.Count, 0) } else { 0 }
+            平均延迟 = if ($gMs.Count) { [math]::Round(($gMs | Measure-Object -Average).Average, 1) } else { $null }
+            最大延迟 = if ($gMs.Count) { ($gMs | Measure-Object -Maximum).Maximum } else { $null }
+          }
+        })
+    }
+
+    # ---- 同期 Windows 系统事件 ----
+    $sysEvents = @(); $sysNote = ''
+    try {
+      $raw = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $started; EndTime = $ended } -ErrorAction Stop)
+      $sysEvents = @($raw | Where-Object { $_.ProviderName -match 'NDIS|RNDIS|Netwtw|USB|usbhub|Kernel-PnP|Dhcp|Tcpip|WLAN|BTHUSB' -or $_.Message -match 'RNDIS|NDIS|USB' } | Select-Object -First 60)
+    } catch {
+      if ("$($_.Exception.Message)" -match 'No events were found|未找到') { $sysEvents = @() }
+      else { $sysNote = "读取系统事件失败（$($_.Exception.Message)）。如需事件关联，请用管理员权限重跑。" }
+    }
+    if (-not $sysEvents.Count -and -not $sysNote) { $sysNote = '同期没有与 USB / 网络相关的系统事件。' }
+
+    # ---- 自动结论 ----
+    $concl = @()
+    if ($outages.Count -eq 0) {
+      $concl += "监控 $([math]::Round($spanSec / 60, 1)) 分钟内未发生断流，链路在该时段是稳定的 —— 可作为后续对比的基线。"
+    } else {
+      $downOut = @($outages | Where-Object { $_.State -and $_.State -ne 'Up' })
+      $upOut = @($outages | Where-Object { $_.State -eq 'Up' })
+      if ($downOut.Count) { $concl += "有 $($downOut.Count) 次断流时适配器**不在 Up 状态** → 指向 USB 侧：线材接触不良、USB 口供电或挂起、驱动重载。" }
+      if ($upOut.Count) { $concl += "有 $($upOut.Count) 次断流时适配器**仍为 Up** → 物理链路正常但无连通：指向手机侧（信号 / 制式切换 / 达量限速 / 省电策略）或运营商。" }
+      $concl += "断流共 $($outages.Count) 次，累计约 ${outageSeconds}s，占监控时长 $([math]::Round(100 * $outageSeconds / $spanSec, 2))%。"
+    }
+    if ($stateChanges.Count) { $concl += "期间发生 $($stateChanges.Count) 次接口状态 / 地址变化（见第 3 节）；IPv4 或网关变化通常意味着 DHCP 续约或手机侧重新分配。" }
+    if ($msArr.Count -and $slowS.Count) { $concl += "有 $($slowS.Count) 次采样延迟超过 ${SlowMs}ms，占成功样本的 $([math]::Round(100 * $slowS.Count / $msArr.Count, 1))%，存在明显劣化 / 拥塞。" }
+    if ($statJit -ne '' -and $statJit -gt 30) { $concl += "整体抖动 ${statJit}ms 偏高，链路不够平稳。" }
+    $lk = @($samples | Where-Object { $_.LinkSpeed } | Select-Object -ExpandProperty LinkSpeed -Unique)
+    if ($lk -match '12 Mbps|12Mbps') { $concl += "监控期间 USB 链路出现过 12Mbps（USB 全速）→ 线材或接口问题的直接证据。" }
+    $concl += "对照方法：手机端自己测速很快、而这里成功率/延迟差 → 瓶颈在电脑或 USB 侧；两边都差 → 瓶颈在无线侧。"
+
+    # ---- 写报告 ----
+    $md = New-Object System.Collections.ArrayList
+    [void]$md.Add('# tether-doctor 挂机监控报告')
+    [void]$md.Add('')
+    [void]$md.Add('| 项 | 值 |')
+    [void]$md.Add('|---|---|')
+    [void]$md.Add("| 开始 | $($started.ToString('yyyy-MM-dd HH:mm:ss')) |")
+    [void]$md.Add("| 结束 | $($ended.ToString('yyyy-MM-dd HH:mm:ss')) |")
+    [void]$md.Add("| 时长 | $([math]::Round($spanSec / 60, 1)) 分钟（采样 $($samples.Count) 次，间隔 ${Interval}s） |")
+    [void]$md.Add("| 共享网卡 | $($ad.Name) — $($ad.InterfaceDescription)（ifIndex $($ad.ifIndex)） |")
+    [void]$md.Add("| 探测目标 | $(($targets | ForEach-Object { "$($_.Host):$($_.Port)" }) -join '、') |")
+    [void]$md.Add("| 判定规则 | 连续失败 $FailThreshold 次 = 断流；延迟 > ${SlowMs}ms = 劣化 |")
+    [void]$md.Add('')
+    [void]$md.Add('## 1. 总览')
+    [void]$md.Add('')
+    [void]$md.Add('| 指标 | 值 |')
+    [void]$md.Add('|---|---|')
+    [void]$md.Add("| 成功率 | $rate%（成功 $($okS.Count) / 失败 $($samples.Count - $okS.Count)） |")
+    [void]$md.Add("| 延迟 最小/中位/P95/最大 (ms) | $statMin / $statMed / $statP95 / $statMax |")
+    [void]$md.Add("| 平均延迟 (ms) | $statAvg |")
+    [void]$md.Add("| 相邻抖动均值 (ms) | $statJit |")
+    [void]$md.Add("| 劣化样本 (>${SlowMs}ms) | $($slowS.Count) |")
+    [void]$md.Add("| 断流事件 | $($outages.Count) 次，累计约 ${outageSeconds}s |")
+    [void]$md.Add('')
+    [void]$md.Add('## 2. 断流事件（证据链）')
+    [void]$md.Add('')
+    if ($outages.Count) {
+      [void]$md.Add('| 开始 | 持续 | 适配器状态 | 说明 |')
+      [void]$md.Add('|---|---|---|---|')
+      foreach ($o in $outages) { [void]$md.Add("| $($o.Time) | $($o.Seconds)s | $($o.State) | $($o.Detail) |") }
+    } else { [void]$md.Add('未发生断流。') }
+    [void]$md.Add('')
+    [void]$md.Add('## 3. 接口状态 / 地址变化')
+    [void]$md.Add('')
+    if ($stateChanges.Count) {
+      [void]$md.Add('| 时间 | 变化 |')
+      [void]$md.Add('|---|---|')
+      foreach ($e in $stateChanges) { [void]$md.Add("| $($e.Time) | $($e.Detail) |") }
+    } else { [void]$md.Add('无变化。') }
+    [void]$md.Add('')
+    [void]$md.Add('## 4. 分时段趋势（每 5 分钟）')
+    [void]$md.Add('')
+    if ($buckets.Count) {
+      [void]$md.Add('| 时段 | 采样 | 成功率 | 平均延迟(ms) | 最大延迟(ms) |')
+      [void]$md.Add('|---|---|---|---|---|')
+      foreach ($b in $buckets) { [void]$md.Add("| $($b.时段) | $($b.采样) | $($b.成功率)% | $($b.平均延迟) | $($b.最大延迟) |") }
+    } else { [void]$md.Add('无数据。') }
+    [void]$md.Add('')
+    [void]$md.Add('## 5. 同期 Windows 系统事件')
+    [void]$md.Add('')
+    if ($sysEvents.Count) {
+      [void]$md.Add('| 时间 | 来源 | 级别 | 事件ID | 摘要 |')
+      [void]$md.Add('|---|---|---|---|---|')
+      foreach ($e in $sysEvents) {
+        $msg = (($e.Message -split "`r?`n")[0])
+        if ($msg.Length -gt 90) { $msg = $msg.Substring(0, 90) + '…' }
+        [void]$md.Add("| $($e.TimeCreated.ToString('HH:mm:ss')) | $($e.ProviderName) | $($e.LevelDisplayName) | $($e.Id) | $($msg -replace '\|', '/') |")
+      }
+    } else { [void]$md.Add($sysNote) }
+    [void]$md.Add('')
+    [void]$md.Add('## 6. 自动结论')
+    [void]$md.Add('')
+    foreach ($c in $concl) { [void]$md.Add("- $c") }
+    [void]$md.Add('')
+    [void]$md.Add('## 7. 原始数据')
+    [void]$md.Add('')
+    [void]$md.Add("逐次采样记录（CSV，可直接用 Excel 画图）：``$csvPath``")
+    [void]$md.Add('')
+    [void]$md.Add('> 想看清「开热点 / 接电话 / 换位置」是否与断流相关，把当时记下的时刻与第 2、4 节的时间戳对齐即可。')
+
+    try {
+      [IO.File]::WriteAllText($mdPath, ($md -join "`r`n"), (New-Object Text.UTF8Encoding($true)))
+      Ok "监控报告：$mdPath"
+      Ok "原始数据：$csvPath"
+    } catch { Bad "报告写入失败：$($_.Exception.Message)" }
+
+    Write-Host ''
+    Info "成功率 $rate%　平均延迟 $statAvg ms　抖动 $statJit ms　断流 $($outages.Count) 次"
+    foreach ($c in $concl) { Info $c }
+  }
+}
+elseif ($Test) {
   Section "10. 实测：TCP 往返 / 丢包 / 抖动（不发大文件，仅几十 KB）"
   function Test-Tcp([string]$Target, [int]$Port, [int]$Count) {
     $t = New-Object System.Collections.ArrayList; $fail = 0
@@ -278,20 +620,23 @@ if ($Test) {
 }
 
 # ---------------------------------------------------------------- 11. 手机端清单
-Section "11. 手机端清单（华为 / 荣耀 MagicOS 为例）"
+Section "11. 手机端清单"
+Info '各品牌完整菜单路径见 docs/PHONE-SETTINGS.md（华为/荣耀、小米/红米、OPPO/一加/realme、vivo/iQOO、三星、魅族、努比亚/红魔）'
 @(
-  '关「智能切换上网卡」：设置 → 移动网络 → SIM 卡管理 → 智能切换上网卡 → 关',
-  '关「WLAN+」：设置 → WLAN → 更多设置 → WLAN+ → 关',
-  '开「休眠时始终保持网络连接」：设置 → 电池 → 更多电池设置 → 开',
-  'USB 共享网络开关：设置 → 移动网络 → 个人热点 → 更多共享设置 → USB 共享网络',
-  '弱信号锁 4G：拨号盘输入 *#*#4636#*#* → 手机信息 → 设置首选网络类型 → LTE only（部分版本已封禁该项）',
-  '开发者选项 → 关闭「USB 调试」（能顺带消掉 HDB Interface 报错）；USB 共享本身不需要调试开关',
-  '省电模式关掉；共享时别同时开 VPN（手机侧 VPN 会把共享流量也拖进去）',
-  '确认当前走的是没被达量限速的那张卡（限速后只有 1Mbps，这是「突然变慢」的头号原因）'
+  '关「智能切换上网卡 / 自动切换数据卡」—— 掉线第一大来源',
+  '关「WLAN+ / WLAN 助理 / 智能网络切换」—— 避免在 WLAN 与移动数据之间反复切换',
+  '开「休眠时始终保持网络连接」（部分系统叫「始终连接」）',
+  'USB 共享网络开关：通常在「个人热点 / 热点与网络共享」里的「更多共享设置」',
+  '弱信号时锁 4G：拨号盘 *#*#4636#*#* → 手机信息 → 设置首选网络类型 → LTE only（部分版本已封禁该项）',
+  '开发者选项 → 关闭「USB 调试」，可顺带消掉 HDB Interface 报错（USB 共享本身不需要它）',
+  '省电模式关掉；共享时别同时开手机侧 VPN（会把共享流量一起拖进去）',
+  '确认走的是没被达量限速的那张卡（限速后只有约 1Mbps，是「突然变慢」的头号原因）',
+  '同时开 Wi-Fi 热点时，电脑侧带宽会被热点设备分走 —— 同一条蜂窝链路，手机内部没有 QoS 能给你优先'
 ) | ForEach-Object { Todo $_ }
 
 # ---------------------------------------------------------------- 汇总
 Section "汇总"
+if ($Watch -gt 0 -and $mdPath) { Ok "监控报告：$mdPath"; Ok "原始数据：$csvPath" }
 if ($script:changes.Count) { Write-Host "  本次改动：" -ForegroundColor Cyan; $script:changes | ForEach-Object { Ok $_ } }
 elseif ($Apply -or $Revert) { Info '本次没有实际改动（可能都已是最优，或缺少管理员权限）' }
 else { Info '只读体检完成，零写入。要落地安全项请用 .bat 提权后加 -Apply' }

@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（形如 v1.1.0，必须已推送到远端）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 打包并发布 Release
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 确定版本号并校验 CHANGELOG
+        id: ver
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch' -and $env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') { throw "tag 必须是 vX.Y.Z 形式，当前为：$tag" }
+          $ver = $Matches[1]
+          if (-not (Select-String -Path CHANGELOG.md -Pattern "## \[$([regex]::Escape($ver))\]" -Quiet)) {
+            throw "CHANGELOG.md 里没有 [$ver] 条目，请先补 CHANGELOG 再发版"
+          }
+          Write-Host "版本号：$ver（tag $tag）"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: 发布前校验
+        shell: powershell
+        run: |
+          ./tests/verify-encoding.ps1
+          ./tests/verify-syntax.ps1
+          ./tests/smoke.ps1
+
+      - name: 打包
+        shell: pwsh
+        run: ./build/build.ps1 -Version '${{ steps.ver.outputs.ver }}' -OutDir dist
+
+      - name: 生成发布说明（取自 CHANGELOG）
+        shell: pwsh
+        run: ./build/get-release-notes.ps1 -Version '${{ steps.ver.outputs.ver }}' -OutFile dist/release-notes.md
+
+      - name: 创建或更新 GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $zip = (Get-ChildItem dist/*.zip | Select-Object -First 1).FullName
+          Write-Host "资产：$zip"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag 已存在，改为覆盖资产并更新说明"
+            gh release upload $tag $zip --clobber --repo $env:GITHUB_REPOSITORY
+            gh release edit $tag --title "tether-doctor $tag" --notes-file dist/release-notes.md --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $tag $zip --title "tether-doctor $tag" --notes-file dist/release-notes.md --verify-tag --repo $env:GITHUB_REPOSITORY
+          }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY --json tagName,assets,url | Out-String | Write-Host

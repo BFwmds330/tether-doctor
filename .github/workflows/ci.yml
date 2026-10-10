@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: 校验（Windows PowerShell 5.1）
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 文件编码校验（.ps1 需 BOM+CRLF，.bat 需无 BOM+CRLF）
+        shell: powershell
+        run: ./tests/verify-encoding.ps1
+
+      - name: 语法校验
+        shell: powershell
+        run: ./tests/verify-syntax.ps1
+
+      - name: 冒烟运行（只读体检 + 挂机监控）
+        shell: powershell
+        run: ./tests/smoke.ps1
+
+      - name: 打包
+        shell: powershell
+        run: ./build/build.ps1 -OutDir dist
+
+      - name: 上传打包产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tether-doctor-dist
+          path: dist/*.zip
+          if-no-files-found: error
+
+  lint:
+    name: PSScriptAnalyzer（信息性，不阻断）
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 运行 PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          $results = Invoke-ScriptAnalyzer -Path ./tether-doctor.ps1 -Severity Error, Warning
+          if ($results) {
+            Write-Host "PSScriptAnalyzer 共 $($results.Count) 条提示："
+            $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+          } else {
+            Write-Host 'PSScriptAnalyzer 无告警'
+          }
