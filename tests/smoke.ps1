@@ -28,9 +28,9 @@ $up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status 
 $adName = if ($up.Count) { $up[0].Name } else { '' }
 if ($adName) { Write-Host "冒烟：使用网卡 '$adName' 进行测试" } else { Write-Host '冒烟：当前没有 Up 状态的网卡，将只验证无网卡时的优雅退出' -ForegroundColor Yellow }
 
-# ---- 1. 只读体检必须退出码 0 且有正常输出 ----
+# ---- 1. 只读体检 + -Test 必须退出码 0 且有正常输出 ----
 $outFile = Join-Path $tmpDir "td-smoke-$id.txt"
-$args1 = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script)
+$args1 = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '-Test')
 if ($adName) { $args1 += @('-AdapterName', $adName) }
 $ErrorActionPreference = 'Continue'   # 子进程的 stderr 行不能终止外层（PS5.1 2>&1 + Stop 的经典坑）
 & $psExe @args1 2>&1 | Out-File $outFile -Encoding utf8 -Width 220
@@ -50,7 +50,12 @@ if ($text -notmatch $expect) {
   Write-Host $text
   exit 1
 }
-Write-Host '只读体检冒烟通过' -ForegroundColor Green
+if ($adName -and $text -notmatch '实测') {
+  Write-Host '冒烟测试失败：-Test 的实测小节没有输出' -ForegroundColor Red
+  Write-Host $text
+  exit 1
+}
+Write-Host '只读体检 + -Test 冒烟通过' -ForegroundColor Green
 
 # ---- 2. -Watch 必须能启动、跑完并落盘报告 ----
 if (-not $adName) {

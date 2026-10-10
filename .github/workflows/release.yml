@@ -57,6 +57,16 @@ jobs:
         shell: pwsh
         run: ./build/get-release-notes.ps1 -Version '${{ steps.ver.outputs.ver }}' -OutFile dist/release-notes.md
 
+      - name: 追加 zip SHA256 到发布说明
+        shell: pwsh
+        run: |
+          $zip = (Get-ChildItem dist/*.zip | Select-Object -First 1).FullName
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash
+          Add-Content -Path dist/release-notes.md -Value ''
+          Add-Content -Path dist/release-notes.md -Value '---'
+          Add-Content -Path dist/release-notes.md -Value ''
+          Add-Content -Path dist/release-notes.md -Value "**SHA256**（$([IO.Path]::GetFileName($zip))）：$sha"
+
       - name: 创建或更新 GitHub Release
         shell: pwsh
         env:
