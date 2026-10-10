@@ -39,15 +39,15 @@ This tool encodes the actual decision tree: **what to suspect, how to prove it, 
 | 11 | Latency / loss / jitter (`-Test`) | TCP round-trips ×N: min / median / avg / max / jitter, a few tens of KB of traffic |
 | 12 | Phone-side checklist | Per-brand menu paths in [docs/PHONE-SETTINGS.md](docs/PHONE-SETTINGS.md) |
 
-## What `-Apply` changes (4 items, all revertible)
+## What `-Apply` changes (5 items; #3/#5 trigger conditionally; all revertible)
 
 | # | Change | Revert |
 |---|---|---|
 | 1 | Disable **global USB selective suspend** (AC + DC) | `3-revert.bat` |
 | 2 | Set tethering NIC DNS to `223.5.5.5 / 119.29.29.29` (configurable) | `3-revert.bat` |
-| 3 | Disable NIC power management *if* the driver supports it (usually not, for RNDIS) | Device Manager |
+| 3 | Disable NIC power management *if* the driver supports it (usually not, for RNDIS) | `3-revert.bat` |
 | 4 | Disable the phone's **Error-state non-RNDIS interface** (typically `HDB Interface`) | `3-revert.bat` |
-| 5 | Only if multiple default routes exist: set the tethering NIC metric to 1 | `Set-NetIPInterface` |
+| 5 | Only if multiple default routes exist: set the tethering NIC metric to 1 | `3-revert.bat` (restores automatic metric) |
 
 The script deliberately does **not** touch the registry, does **not** automate hub-level power saving (there is no reliable registry equivalent — you get a checklist instead), and does **not** run bandwidth tests (it will not burn your data plan).
 

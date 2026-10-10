@@ -197,6 +197,11 @@ try {
   if ($Apply) {
     try { Disable-NetAdapterPowerManagement -Name $ad.Name -Confirm:$false -ErrorAction Stop; [void]$script:changes.Add("已禁用网卡 $($ad.Name) 的电源管理"); Ok '已禁用该网卡的电源管理' }
     catch { Warn "禁用失败：$($_.Exception.Message)" }
+  } elseif ($Revert) {
+    if ($isAdmin) {
+      try { Enable-NetAdapterPowerManagement -Name $ad.Name -Confirm:$false -ErrorAction Stop; [void]$script:changes.Add("已启用网卡 $($ad.Name) 的电源管理"); Ok '已启用该网卡的电源管理' }
+      catch { Warn "启用失败：$($_.Exception.Message)" }
+    } else { Bad '需要管理员权限，跳过' }
   }
 } catch {
   Ok '该驱动不支持电源管理 —— 设备管理器里没有「电源管理」标签页是正常的，不是你没找到'
@@ -232,11 +237,15 @@ if ($Apply -and ($st.AC -notmatch '0x0+$' -or $st.DC -notmatch '0x0+$')) {
   }
 } elseif ($Revert) {
   if ($isAdmin) {
-    powercfg /setacvalueindex SCHEME_CURRENT $sub $set 1 | Out-Null
-    powercfg /setdcvalueindex SCHEME_CURRENT $sub $set 1 | Out-Null
-    powercfg /setactive SCHEME_CURRENT | Out-Null
-    [void]$script:changes.Add('已恢复全局 USB 选择性暂停=启用')
-    Ok '已恢复为「启用」'
+    $cur = Get-UsbSuspend
+    if ($cur.AC -match '0x0+$' -or $cur.DC -match '0x0+$') {
+      powercfg /setacvalueindex SCHEME_CURRENT $sub $set 1 | Out-Null
+      powercfg /setdcvalueindex SCHEME_CURRENT $sub $set 1 | Out-Null
+      powercfg /setactive SCHEME_CURRENT | Out-Null
+      [void]$script:changes.Add('已恢复全局 USB 选择性暂停=启用（Windows 默认值）')
+      Ok '已恢复为「启用」（Windows 默认值）。注：若你原本是手动禁用的（没跑过本脚本的 -Apply），请自行改回'
+      Show-Suspend (Get-UsbSuspend)
+    } else { Info '全局 USB 选择性暂停已是「启用」，无需恢复' }
   } else { Bad '需要管理员权限，跳过' }
 }
 
@@ -266,22 +275,39 @@ if (@($routes).Count -gt 1) {
   Info '建议：共享上网时断开其他网络；确需并存则把共享网卡跃点调到最小'
   if ($Apply) {
     if ($isAdmin) {
-      try { Set-NetIPInterface -InterfaceIndex $ad.ifIndex -InterfaceMetric 1 -ErrorAction Stop; [void]$script:changes.Add("已把 $($ad.Name) 接口跃点设为 1"); Ok '已把共享网卡接口跃点设为 1' }
+      try {
+        $origMetric = @($iface)[0].InterfaceMetric
+        Set-NetIPInterface -InterfaceIndex $ad.ifIndex -InterfaceMetric 1 -ErrorAction Stop
+        [void]$script:changes.Add("已把 $($ad.Name) 接口跃点设为 1（原值 $origMetric）")
+        Ok "已把共享网卡接口跃点设为 1（原值 $origMetric；若原本是自动跃点，-Revert 会还原为自动）"
+      }
       catch { Warn "设置跃点失败：$($_.Exception.Message)" }
     } else { Bad '需要管理员权限，跳过' }
   }
 } else { Ok '只有一条默认路由，干净' }
+if ($Revert) {
+  if ($isAdmin) {
+    try { Set-NetIPInterface -InterfaceIndex $ad.ifIndex -InterfaceMetric Automatic -ErrorAction Stop; [void]$script:changes.Add("已把 $($ad.Name) 接口跃点恢复为自动"); Ok '已把共享网卡接口跃点恢复为自动（Windows 按链路速率重算）' }
+    catch { Warn "恢复跃点失败：$($_.Exception.Message)" }
+  } else { Bad '需要管理员权限，跳过' }
+}
 
 # ---------------------------------------------------------------- 7. DNS
 Section "7. DNS"
 if (-not $dnsNow) { Warn '当前走 DHCP 下发的 DNS（运营商 DNS 常较慢/不稳）' } else { Info "当前：$($dnsNow -join ', ')" }
 if ($Apply) {
   if ($isAdmin) {
-    try { Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ServerAddresses $Dns -ErrorAction Stop; [void]$script:changes.Add("已把 $($ad.Name) 的 DNS 设为 $($Dns -join ', ')"); Ok "已设为 $($Dns -join ', ')" }
+    try {
+      $prevDns = @($dnsNow)
+      Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ServerAddresses $Dns -ErrorAction Stop
+      $prevTxt = if ($prevDns.Count) { $prevDns -join ', ' } else { '自动获取（DHCP）' }
+      [void]$script:changes.Add("已把 $($ad.Name) 的 DNS 设为 $($Dns -join ', ')（原值：$prevTxt）")
+      Ok "已设为 $($Dns -join ', ')（原值：$prevTxt）"
+    }
     catch { Warn "设置 DNS 失败：$($_.Exception.Message)" }
   } else { Bad '需要管理员权限，跳过' }
 } elseif ($Revert) {
-  if ($isAdmin) { Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue; [void]$script:changes.Add("已把 $($ad.Name) 的 DNS 恢复为自动"); Ok '已恢复为自动获取' }
+  if ($isAdmin) { Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue; [void]$script:changes.Add("已把 $($ad.Name) 的 DNS 恢复为自动"); Ok '已恢复为自动获取（若原本是手动 DNS，请按 -Apply 运行时打印的「原值」改回）' }
   else { Bad '需要管理员权限，跳过' }
 } else { Todo "如需加速解析：-Apply 会把本网卡 DNS 设为 $($Dns -join ', ')" }
 
@@ -443,7 +469,8 @@ if ($Watch -gt 0) {
       [void]$events.Add([pscustomobject]@{ Time = $outageStart.ToString('HH:mm:ss'); Type = '断流(未恢复)'; Seconds = $secs; State = $outageState; Detail = "监控结束时仍未恢复，已持续约 ${secs}s" })
     }
 
-    try { $samples | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 } catch { Warn "CSV 写入失败：$($_.Exception.Message)" }
+    # 统一带 BOM 的 UTF-8：5.1 的 'UTF8' 自带 BOM，7.x 需显式 'utf8BOM'，否则中文 Excel 直接打开会乱码
+    try { $csvEnc = if ($PSVersionTable.PSVersion.Major -ge 7) { 'utf8BOM' } else { 'UTF8' }; $samples | Export-Csv -Path $csvPath -NoTypeInformation -Encoding $csvEnc } catch { Warn "CSV 写入失败：$($_.Exception.Message)" }
 
     # ---- 统计 ----
     $okS = @($samples | Where-Object { $_.Ok })
@@ -489,8 +516,8 @@ if ($Watch -gt 0) {
       $raw = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $started; EndTime = $ended } -ErrorAction Stop)
       $sysEvents = @($raw | Where-Object { $_.ProviderName -match 'NDIS|RNDIS|Netwtw|USB|usbhub|Kernel-PnP|Dhcp|Tcpip|WLAN|BTHUSB' -or $_.Message -match 'RNDIS|NDIS|USB' } | Select-Object -First 60)
     } catch {
-      if ("$($_.Exception.Message)" -match 'No events were found|未找到') { $sysEvents = @() }
-      else { $sysNote = "读取系统事件失败（$($_.Exception.Message)）。如需事件关联，请用管理员权限重跑。" }
+      if ("$($_.Exception.Message)" -match 'No events|未找到|找不到') { $sysEvents = @() }
+      else { $sysNote = "系统事件未能读取（$($_.Exception.Message)）。可能是权限不足或日志被清空；如需事件关联，请用管理员权限重跑。" }
     }
     if (-not $sysEvents.Count -and -not $sysNote) { $sysNote = '同期没有与 USB / 网络相关的系统事件。' }
 

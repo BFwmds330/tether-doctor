@@ -40,6 +40,25 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  verify-pwsh:
+    name: 校验（PowerShell 7）
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 文件编码校验
+        shell: pwsh
+        run: ./tests/verify-encoding.ps1
+
+      - name: 语法校验
+        shell: pwsh
+        run: ./tests/verify-syntax.ps1
+
+      - name: 冒烟运行（子进程为当前宿主 pwsh，真实验证 7.x 路径）
+        shell: pwsh
+        run: ./tests/smoke.ps1
+
   lint:
     name: PSScriptAnalyzer（信息性，不阻断）
     runs-on: windows-latest

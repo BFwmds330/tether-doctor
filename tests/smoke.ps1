@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-  冒烟测试：在 Windows PowerShell 5.1 子进程里真跑一次只读体检与 -Watch 监控，断言不报错、有正常输出。
+  冒烟测试：用「当前宿主」（Windows PowerShell 5.1 或 PowerShell 7）的子进程真跑一次只读体检与 -Watch 监控，断言不报错、有正常输出。
 
 .DESCRIPTION
   CI runner 上没有手机共享网卡。因此本测试会挑一块处于 Up 状态的网卡，
@@ -17,6 +17,13 @@ $script = Join-Path $root 'tether-doctor.ps1'
 $tmpDir = [IO.Path]::GetTempPath()
 $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
 
+# 编码三重坑的修复（中文 Windows 936 代码页实测）：
+# 1) native stdout 按「外层」[Console]::OutputEncoding（GBK）解码 → 中文先坏一层，故捕获前强制 UTF-8；
+# 2) PS5.1 的 *> 重定向按 UTF-16LE 落盘 → 显式 Out-File -Encoding utf8；
+# 3) 子进程改用当前宿主（5.1 跑 5.1、7 跑 7），同一份冒烟在两种宿主下都真正执行主脚本。
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$psExe = (Get-Process -Id $PID).Path
+
 $up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1)
 $adName = if ($up.Count) { $up[0].Name } else { '' }
 if ($adName) { Write-Host "冒烟：使用网卡 '$adName' 进行测试" } else { Write-Host '冒烟：当前没有 Up 状态的网卡，将只验证无网卡时的优雅退出' -ForegroundColor Yellow }
@@ -25,8 +32,10 @@ if ($adName) { Write-Host "冒烟：使用网卡 '$adName' 进行测试" } else 
 $outFile = Join-Path $tmpDir "td-smoke-$id.txt"
 $args1 = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script)
 if ($adName) { $args1 += @('-AdapterName', $adName) }
-& powershell @args1 *> $outFile
+$ErrorActionPreference = 'Continue'   # 子进程的 stderr 行不能终止外层（PS5.1 2>&1 + Stop 的经典坑）
+& $psExe @args1 2>&1 | Out-File $outFile -Encoding utf8 -Width 220
 $code = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
 $text = if (Test-Path $outFile) { Get-Content $outFile -Raw -Encoding UTF8 } else { '' }
 Remove-Item $outFile -Force -ErrorAction SilentlyContinue
 
@@ -54,9 +63,12 @@ $watchOut = Join-Path $tmpDir "td-smoke-watch-$id.txt"
 try {
   $args2 = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script,
     '-Watch', '1', '-Interval', '60', '-LogDir', $logDir, '-AdapterName', $adName)
-  & powershell @args2 *> $watchOut
-  if ($LASTEXITCODE -ne 0) {
-    Write-Host "-Watch 冒烟失败：退出码 $LASTEXITCODE" -ForegroundColor Red
+  $ErrorActionPreference = 'Continue'
+  & $psExe @args2 2>&1 | Out-File $watchOut -Encoding utf8 -Width 220
+  $watchCode = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  if ($watchCode -ne 0) {
+    Write-Host "-Watch 冒烟失败：退出码 $watchCode" -ForegroundColor Red
     if (Test-Path $watchOut) { Write-Host (Get-Content $watchOut -Raw -Encoding UTF8) }
     exit 1
   }
