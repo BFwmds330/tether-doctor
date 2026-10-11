@@ -5,6 +5,6 @@ fltmc >nul 2>&1 || (
   powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
   exit /b
 )
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tether-doctor.ps1" -Revert
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tether-doctor.ps1" -Revert -Test
 echo.
 pause

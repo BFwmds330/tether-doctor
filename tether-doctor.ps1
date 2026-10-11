@@ -99,7 +99,7 @@ param(
   [switch]$Sanitize
 )
 
-$script:Version = '1.2.1'
+$script:Version = '1.2.2'
 
 if ($Apply -and $Revert) { throw '参数冲突：-Apply 与 -Revert 不能同时使用（落地与回滚请分开各跑一次）。' }
 

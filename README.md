@@ -290,8 +290,8 @@ A：用 `-AdapterName` / `-InterfaceIndex` 可以指向任意网卡（例如 Wi-
 tether-doctor/
 ├── tether-doctor.ps1              主脚本（体检 / -Test / -Watch / -Apply / -Revert）
 ├── 1-check.bat                    双击：只读体检（自动提权）
-├── 2-apply.bat                    双击：落地安全项（自动提权）
-├── 3-revert.bat                   双击：回滚（自动提权）
+├── 2-apply.bat                    双击：落地安全项 + 实测（自动提权）
+├── 3-revert.bat                   双击：回滚 + 实测（自动提权）
 ├── docs/
 │   ├── DESIGN.md                  实现原理与每一项判定的依据
 │   └── PHONE-SETTINGS.md          全品牌手机菜单路径
